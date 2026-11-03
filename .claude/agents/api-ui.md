@@ -46,3 +46,15 @@ CHECKPOINT A DECISIONS (Sahil, binding):
   (for example `docker run --network none` on the test image, or a job container with
   no network). It complements the Python-level guard in tests/conftest.py, which cannot
   see subprocesses or C-level clients such as libpq.
+- Tokenizer cache in CI (ci.yml and evals.yml): unit tests run behind a network guard
+  (tests/conftest.py), and tiktoken downloads cl100k_base on first use. So every job
+  that runs pytest must, BEFORE pytest:
+  1. Read the pinned tiktoken version from pyproject.toml (tiktoken==X.Y.Z) into an env
+     var, so the cache key and the install can never drift apart.
+  2. Set TIKTOKEN_CACHE_DIR to a workspace path, for example .cache/tiktoken.
+  3. Restore it with actions/cache, key "tiktoken-<version>-cl100k_base" (today
+     tiktoken-0.14.0-cl100k_base).
+  4. On a cache miss, pre-fetch in a separate step outside pytest:
+     python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"
+  Never weaken the network guard to make CI pass. A NetworkBlockedError naming
+  openaipublic.blob.core.windows.net means this pre-fetch step is missing or broken.
