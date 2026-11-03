@@ -1,0 +1,14 @@
+# FilingCheck conventions
+- Read PLAN.md before starting any task. Work on one phase at a time.
+- Python 3.11, type hints everywhere, small functions, no classes unless they hold state (data models and Protocols in contracts.py are fine).
+- Every EDGAR request goes through edgar/client.py (User-Agent + rate limit + disk cache).
+- Never generate or edit evals/golden.jsonl. Sahil writes it by hand.
+- Never hardcode thresholds. They live in config.py with a comment on how they were chosen.
+- Every new module gets a pytest file. Run tests before saying a task is done.
+- Writing style in docs and comments: plain English, single hyphens only, no em or en dashes.
+- Never edit contracts.py or config.py unless you are contracts-architect with a specific change request.
+- ask() defaults to eval_mode=False. Never expose eval_mode through the API.
+- The mechanical quote check runs in every mode. No code path may return an uncited answer.
+- No metric, score, or threshold value goes into README or docs unless it comes from evals/results.json.
+- Unit tests never call the network. Mock EDGAR and every LLM.
+- When a phase is done, print the acceptance check result and stop. Do not start the next phase.
