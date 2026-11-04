@@ -34,7 +34,7 @@ question -> BM25 search + vector search -> RRF merge -> cross-encoder rerank (to
                                   answer  OR  "needs review" + reason
 ```
 
-**Stack:** Python 3.11, FastAPI, PostgreSQL 16 with pgvector, OpenAI embeddings (text-embedding-3-small, 1536 dimensions), an open cross-encoder for reranking (`cross-encoder/ms-marco-MiniLM-L-6-v2`), Streamlit front end, pytest, GitHub Actions, Docker Compose for local Postgres.
+**Stack:** Python 3.11, FastAPI, PostgreSQL 16 with pgvector, local sentence-transformers embeddings by default (BAAI/bge-small-en-v1.5, 384 dimensions; OpenAI text-embedding-3-small optional via EMBEDDING_PROVIDER), pluggable LLM providers (OpenAI, Anthropic, or local Ollama) behind one LLM client with record and replay, an open cross-encoder for reranking (`cross-encoder/ms-marco-MiniLM-L-6-v2`), Streamlit front end, pytest, GitHub Actions, Docker Compose for local Postgres.
 
 **Models:** generation, verification, and judge are separate config settings. The judge should come from a different model family than the generator, to reduce self-preference bias. Sahil sets the final model names.
 
@@ -60,6 +60,8 @@ filingcheck/
     answer/generate.py      # prompt + citation format
     answer/verify.py        # claim-by-claim evidence check
     answer/route.py         # confidence decision + reason
+    llm/client.py           # LLMClient: every LLM call, live / record / replay cache (eval-harness)
+    llm/embed.py            # EmbedTexts: query or passage, local or OpenAI (edgar-ingest)
     pipeline.py             # ask(question, ticker, fiscal_year, *, eval_mode=False)
     api/main.py             # FastAPI: POST /ask
   app/streamlit_app.py
@@ -232,4 +234,4 @@ Put this in `CLAUDE.md` so Claude Code follows the same rules every session:
 | Quote check | Runs in every mode, including eval mode |
 | CONFLICT | Deterministic precondition first, LLM disagreement check second, both recorded |
 | Models | Separate generation, verifier, and judge settings; judge from a different family; Sahil picks names |
-| Kept as is | 400-600 token chunks, 75 overlap, cl100k_base, text-embedding-3-small at 1536, BM25_K 50, VECTOR_K 50, RRF_K 60, ms-marco-MiniLM-L-6-v2, temperature 0, EDGAR 8 req/s, 5 retries, min_rerank_score None until Checkpoint D |
+| Kept as is | 400-600 token chunks, 75 overlap, cl100k_base, text-embedding-3-small at 1536 (replaced in Contracts v2 by local bge-small-en-v1.5 at 384), BM25_K 50, VECTOR_K 50, RRF_K 60, ms-marco-MiniLM-L-6-v2, temperature 0, EDGAR 8 req/s, 5 retries, min_rerank_score None until Checkpoint D |

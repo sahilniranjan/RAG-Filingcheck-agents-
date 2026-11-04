@@ -14,30 +14,41 @@ from pydantic import BaseModel, ValidationError
 from filingcheck import config
 from filingcheck.contracts import (
     CHUNK_ID_LENGTH,
+    EMBED_KINDS,
+    EMBEDDING_PROVIDERS,
     GOLD_QUOTE_ENCODING,
     GOLD_QUOTE_MAX_TOKENS,
     GOLDEN_TYPES,
     ITEM_CODES,
+    LLM_MODES,
+    LLM_PROVIDERS,
     RETRIEVAL_MODES,
     Answer,
     AnswerSentence,
     Ask,
+    CacheMissError,
     Chunk,
     ChunkSection,
     Citation,
     Declined,
+    EmbedTexts,
     ExtractSections,
     FetchFilings,
     Filing,
     GenerateAnswer,
     GoldenItem,
     GoldEvidence,
+    IndexFingerprintMismatchError,
+    LLMClient,
+    LLMMessage,
+    LLMResponse,
     NeedsReview,
     NeedsReviewReason,
     Rerank,
     RetrievedChunk,
     Route,
     RRFMerge,
+    RunManifest,
     SearchBM25,
     SearchVector,
     Section,
@@ -48,8 +59,11 @@ from filingcheck.contracts import (
     VerificationResult,
     VerifyAnswer,
     conflict_precondition,
+    embedding_input,
     evidence_in_chunk,
     format_citation,
+    index_fingerprint,
+    llm_cache_key,
     make_chunk_id,
     normalize_whitespace,
 )
@@ -400,6 +414,7 @@ def test_protocols_are_runtime_checkable() -> None:
         VerifyAnswer,
         Route,
         Ask,
+        EmbedTexts,
     ):
         assert isinstance(anything, proto)
         assert proto.__doc__ and "Failure" in proto.__doc__
@@ -1090,3 +1105,488 @@ def test_unrouted_stages_replace_timings_and_token_cost() -> None:
     for old in ("timings", "token_cost"):
         with pytest.raises(ValidationError):
             _unrouted_with(**{old: ()})
+
+
+# ---------------------------------------------------------------------------
+# Contracts v2: local embeddings, pluggable LLM providers, cache, fingerprint
+# ---------------------------------------------------------------------------
+
+
+def test_default_embeddings_are_local() -> None:
+    s = config.load_settings({})
+    assert (s.embedding_provider, s.embedding_model, s.embedding_dim) == (
+        "local",
+        "BAAI/bge-small-en-v1.5",
+        384,
+    )
+    assert config.KNOWN_EMBEDDING_PROVIDERS[s.embedding_model] == "local"
+
+
+def test_schema_vector_dim_equals_default_embedding_dim() -> None:
+    dims = re.findall(r"vector\((\d+)\)", SCHEMA.read_text())
+    assert dims == [str(config.load_settings({}).embedding_dim)]
+
+
+def test_every_known_embedding_model_has_a_provider() -> None:
+    assert set(config.KNOWN_EMBEDDING_DIMS) == set(config.KNOWN_EMBEDDING_PROVIDERS)
+    assert set(config.KNOWN_EMBEDDING_PROVIDERS.values()) <= set(EMBEDDING_PROVIDERS)
+
+
+def test_openai_embeddings_still_load() -> None:
+    s = config.load_settings(
+        {
+            "EMBEDDING_PROVIDER": "openai",
+            "EMBEDDING_MODEL": "text-embedding-3-small",
+            "EMBEDDING_DIM": "1536",
+        }
+    )
+    assert s.embedding_dim == 1536
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {
+            "EMBEDDING_PROVIDER": "local",
+            "EMBEDDING_MODEL": "text-embedding-3-small",
+            "EMBEDDING_DIM": "1536",
+        },
+        {
+            "EMBEDDING_PROVIDER": "local",
+            "EMBEDDING_MODEL": "text-embedding-4-future",
+            "EMBEDDING_DIM": "1024",
+        },
+        {"EMBEDDING_PROVIDER": "openai", "EMBEDDING_MODEL": "BAAI/bge-small-en-v1.5"},
+    ],
+)
+def test_mismatched_embedding_provider_and_model_refused(env: dict) -> None:
+    with pytest.raises(config.ConfigError, match="EMBEDDING_PROVIDER"):
+        config.load_settings(env)
+
+
+def test_unknown_local_embedding_model_allowed() -> None:
+    s = config.load_settings({"EMBEDDING_MODEL": "someorg/custom-embedder", "EMBEDDING_DIM": "512"})
+    assert s.embedding_dim == 512
+
+
+def test_embedding_dim_still_checked_for_local_model() -> None:
+    with pytest.raises(config.ConfigError, match="EMBEDDING_DIM"):
+        config.load_settings({"EMBEDDING_DIM": "1536"})
+    with pytest.raises(config.ConfigError, match="EMBEDDING_DIM"):
+        config.load_settings({"EMBEDDING_MODEL": "BAAI/bge-base-en-v1.5"})
+    assert (
+        config.load_settings(
+            {"EMBEDDING_MODEL": "BAAI/bge-base-en-v1.5", "EMBEDDING_DIM": "768"}
+        ).embedding_dim
+        == 768
+    )
+
+
+def test_unknown_embedding_provider_refused() -> None:
+    with pytest.raises(config.ConfigError, match="EMBEDDING_PROVIDER"):
+        config.load_settings({"EMBEDDING_PROVIDER": "cohere"})
+
+
+def test_provider_and_mode_values() -> None:
+    assert EMBEDDING_PROVIDERS == ("local", "openai")
+    assert LLM_PROVIDERS == ("openai", "anthropic", "ollama")
+    assert LLM_MODES == ("live", "record", "replay")
+
+
+def test_default_llm_settings() -> None:
+    s = config.load_settings({})
+    assert (s.generation_provider, s.verifier_provider, s.judge_provider) == (
+        "openai",
+        "openai",
+        "openai",
+    )
+    assert s.llm_mode == "live"
+    assert s.ollama_base_url == "http://localhost:11434"
+
+
+@pytest.mark.parametrize("provider", LLM_PROVIDERS)
+def test_every_llm_provider_accepted(provider: str) -> None:
+    s = config.load_settings(
+        {"LLM_PROVIDER": provider, "VERIFIER_PROVIDER": provider, "JUDGE_PROVIDER": provider}
+    )
+    assert (s.generation_provider, s.verifier_provider, s.judge_provider) == (provider,) * 3
+
+
+@pytest.mark.parametrize("name", ["LLM_PROVIDER", "VERIFIER_PROVIDER", "JUDGE_PROVIDER"])
+def test_unknown_llm_provider_refused(name: str) -> None:
+    with pytest.raises(config.ConfigError, match=name):
+        config.load_settings({name: "gemini"})
+
+
+@pytest.mark.parametrize("mode", LLM_MODES)
+def test_llm_mode_values_accepted(mode: str) -> None:
+    assert config.load_settings({"LLM_MODE": mode}).llm_mode == mode
+
+
+def test_unknown_llm_mode_refused() -> None:
+    with pytest.raises(config.ConfigError, match="LLM_MODE"):
+        config.load_settings({"LLM_MODE": "offline"})
+
+
+def test_ollama_base_url_must_be_http() -> None:
+    with pytest.raises(config.ConfigError, match="OLLAMA_BASE_URL"):
+        config.load_settings({"OLLAMA_BASE_URL": "localhost:11434"})
+
+
+def test_api_keys_never_in_settings_repr() -> None:
+    s = config.load_settings({"OPENAI_API_KEY": "sk-secret-1", "ANTHROPIC_API_KEY": "sk-ant-2"})
+    assert (s.openai_api_key, s.anthropic_api_key) == ("sk-secret-1", "sk-ant-2")
+    assert "sk-secret-1" not in repr(s)
+    assert "sk-ant-2" not in repr(s)
+
+
+def test_env_example_lists_every_new_variable() -> None:
+    text = (ROOT / ".env.example").read_text()
+    for name in (
+        "EMBEDDING_PROVIDER",
+        "LLM_PROVIDER",
+        "VERIFIER_PROVIDER",
+        "JUDGE_PROVIDER",
+        "OLLAMA_BASE_URL",
+        "LLM_MODE",
+        "ANTHROPIC_API_KEY",
+    ):
+        assert re.search(rf"^{name}=", text, re.MULTILINE), name
+
+
+def test_ollama_service_is_opt_in() -> None:
+    compose = (ROOT / "docker-compose.yml").read_text()
+    assert 'profiles: ["ollama"]' in compose
+    assert re.search(r"image: ollama/ollama:\d+\.\d+\.\d+", compose)
+
+
+# LLM cache key
+
+
+def _msgs(*pairs: tuple[str, str]) -> list[LLMMessage]:
+    return [LLMMessage(role=r, content=c) for r, c in pairs]  # type: ignore[arg-type]
+
+
+_BASE_MSGS = (("system", "Answer only from the chunks."), ("user", "What is FAKEA's risk?"))
+
+
+def _key(**over: object) -> str:
+    args: dict = {
+        "provider": "openai",
+        "model": "gpt-4o-mini",
+        "prompt_version": "generate-v1",
+        "messages": _msgs(*_BASE_MSGS),
+        "temperature": 0.0,
+    }
+    args.update(over)
+    return llm_cache_key(**args)
+
+
+def test_llm_cache_key_is_deterministic_sha256() -> None:
+    assert _key() == _key()
+    assert re.fullmatch(r"[0-9a-f]{64}", _key())
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"provider": "anthropic"},
+        {"model": "gpt-4o"},
+        {"prompt_version": "generate-v2"},
+        {"temperature": 0.2},
+        {"messages": _msgs(*_BASE_MSGS[:1])},
+        {"messages": _msgs(_BASE_MSGS[1], _BASE_MSGS[0])},
+        {"messages": _msgs(("user", _BASE_MSGS[0][1]), _BASE_MSGS[1])},
+        {"messages": _msgs(_BASE_MSGS[0], ("user", "What is FAKEB's risk?"))},
+    ],
+    ids=[
+        "provider",
+        "model",
+        "prompt_version",
+        "temperature",
+        "message_count",
+        "message_order",
+        "message_role",
+        "message_content",
+    ],
+)
+def test_llm_cache_key_changes_with_every_input(over: dict) -> None:
+    assert _key(**over) != _key()
+
+
+def test_llm_cache_key_normalizes_temperature() -> None:
+    assert _key(temperature=0) == _key(temperature=0.0) == _key(temperature=-0.0)
+    assert _key(temperature=1) == _key(temperature=1.0)
+
+
+@pytest.mark.parametrize("over", [{"prompt_version": " "}, {"temperature": float("nan")}])
+def test_llm_cache_key_rejects_bad_input(over: dict) -> None:
+    with pytest.raises(ValueError):
+        _key(**over)
+
+
+def test_llm_message_rejects_unknown_role_and_empty_content() -> None:
+    with pytest.raises(ValidationError):
+        LLMMessage(role="tool", content="x")  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        LLMMessage(role="user", content="")
+
+
+def test_cache_errors_are_exceptions() -> None:
+    assert issubclass(CacheMissError, Exception)
+    assert issubclass(IndexFingerprintMismatchError, Exception)
+    assert "network" in (CacheMissError.__doc__ or "")
+
+
+def test_llm_client_protocol() -> None:
+    from types import SimpleNamespace
+
+    def complete(messages, model, provider, temperature, prompt_version):
+        return None
+
+    assert isinstance(SimpleNamespace(complete=complete), LLMClient)
+    assert not isinstance(SimpleNamespace(), LLMClient)
+    doc = LLMClient.__doc__ or ""
+    for phrase in ("Failure", "CacheMissError", "never touches the network", "record"):
+        assert phrase in doc
+
+
+def test_llm_response_round_trip_and_stage_metrics_fit() -> None:
+    r = LLMResponse(
+        text="ok",
+        input_tokens=120,
+        output_tokens=30,
+        cache_hit=True,
+        provider="ollama",
+        model="llama3.1:8b",
+    )
+    assert LLMResponse.model_validate_json(r.model_dump_json()) == r
+    m = StageMetrics(
+        stage="generate",
+        latency_ms=1.0,
+        prompt_tokens=r.input_tokens,
+        completion_tokens=r.output_tokens,
+    )
+    assert m.prompt_tokens == 120
+    with pytest.raises(ValidationError):
+        LLMResponse(
+            text="", input_tokens=-1, output_tokens=0, cache_hit=False, provider="openai", model="m"
+        )
+
+
+def test_llm_package_exists() -> None:
+    import filingcheck.llm  # noqa: F401
+
+
+# Index fingerprint
+
+_IDS = ("a" * 32, "b" * 32, "c" * 32)
+
+
+def _fp(**over: object) -> str:
+    args: dict = {
+        "chunk_ids": list(_IDS),
+        "embedding_provider": "local",
+        "embedding_model": "BAAI/bge-small-en-v1.5",
+        "embedding_dim": 384,
+    }
+    args.update(over)
+    return index_fingerprint(**args)
+
+
+def test_index_fingerprint_is_deterministic_and_order_independent() -> None:
+    assert _fp() == _fp()
+    assert re.fullmatch(r"[0-9a-f]{64}", _fp())
+    assert _fp(chunk_ids=list(reversed(_IDS))) == _fp()
+    assert _fp(chunk_ids=tuple(_IDS)) == _fp()
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"chunk_ids": list(_IDS[:2])},
+        {"chunk_ids": [*_IDS, "d" * 32]},
+        {"embedding_provider": "openai"},
+        {"embedding_model": "BAAI/bge-base-en-v1.5"},
+        {"embedding_dim": 768},
+    ],
+    ids=["fewer_ids", "more_ids", "provider", "model", "dim"],
+)
+def test_index_fingerprint_changes_with_every_input(over: dict) -> None:
+    assert _fp(**over) != _fp()
+
+
+def test_index_fingerprint_refuses_duplicates() -> None:
+    with pytest.raises(ValueError, match="duplicate"):
+        _fp(chunk_ids=[*_IDS, _IDS[0]])
+
+
+def test_index_fingerprint_on_fixture_chunks() -> None:
+    ids = [c.chunk_id for c in _fixture_chunks()]
+    assert _fp(chunk_ids=ids) == _fp(chunk_ids=sorted(ids))
+    assert _fp(chunk_ids=[]) != _fp(chunk_ids=ids)
+
+
+def _manifest(**over: object) -> RunManifest:
+    s = config.load_settings({})
+    args: dict = {
+        "index_fingerprint": _fp(),
+        "llm_mode": s.llm_mode,
+        "embedding_provider": s.embedding_provider,
+        "embedding_model": s.embedding_model,
+        "embedding_dim": s.embedding_dim,
+        "embedding_query_prefix": s.embedding_query_prefix,
+        "generation_provider": s.generation_provider,
+        "generation_model": s.generation_model,
+        "verifier_provider": s.verifier_provider,
+        "verifier_model": s.verifier_model,
+        "judge_provider": s.judge_provider,
+        "judge_model": s.judge_model,
+        "llm_temperature": s.llm_temperature,
+    }
+    args.update(over)
+    return RunManifest(**args)
+
+
+def test_run_manifest_round_trip_and_validation() -> None:
+    m = _manifest()
+    assert RunManifest.model_validate_json(m.model_dump_json()) == m
+    for bad in (
+        {"index_fingerprint": "abc"},
+        {"llm_mode": "offline"},
+        {"judge_provider": "gemini"},
+        {"embedding_provider": "cohere"},
+    ):
+        with pytest.raises(ValidationError):
+            _manifest(**bad)
+
+
+# ---------------------------------------------------------------------------
+# Contracts v2.1: embed kinds and query prefix, missing API key errors
+# ---------------------------------------------------------------------------
+
+_PREFIX = config.BGE_QUERY_INSTRUCTION
+_TEXT = "What cybersecurity risks does FAKEA describe?"
+
+
+def test_embed_kinds() -> None:
+    assert EMBED_KINDS == ("query", "passage")
+
+
+def test_query_input_is_prefix_plus_passage_input() -> None:
+    q = embedding_input(_TEXT, "query", _PREFIX)
+    p = embedding_input(_TEXT, "passage", _PREFIX)
+    assert p == _TEXT
+    assert q == _PREFIX + p
+    assert q.removeprefix(_PREFIX) == p
+
+
+def test_passage_ignores_prefix() -> None:
+    assert embedding_input(_TEXT, "passage", "anything: ") == embedding_input(_TEXT, "passage", "")
+
+
+def test_empty_prefix_makes_query_equal_passage() -> None:
+    assert embedding_input(_TEXT, "query", "") == embedding_input(_TEXT, "passage", "")
+
+
+def test_unknown_embed_kind_rejected() -> None:
+    with pytest.raises(ValueError, match="embed kind"):
+        embedding_input(_TEXT, "document", _PREFIX)  # type: ignore[arg-type]
+
+
+def test_embed_texts_takes_kind() -> None:
+    import inspect
+
+    params = inspect.signature(EmbedTexts.__call__).parameters
+    assert list(params) == ["self", "texts", "kind"]
+    doc = EmbedTexts.__doc__ or ""
+    for phrase in ("L2-normalized", 'kind="passage"', 'kind="query"', "embedding_input"):
+        assert phrase in doc
+
+
+def test_bge_instruction_is_exact() -> None:
+    assert _PREFIX == "Represent this sentence for searching relevant passages: "
+
+
+def test_query_prefix_default_per_model() -> None:
+    assert set(config.KNOWN_EMBEDDING_QUERY_PREFIXES) == set(config.KNOWN_EMBEDDING_DIMS)
+    assert config.load_settings({}).embedding_query_prefix == _PREFIX
+    base = {"EMBEDDING_MODEL": "BAAI/bge-base-en-v1.5", "EMBEDDING_DIM": "768"}
+    assert config.load_settings(base).embedding_query_prefix == _PREFIX
+    openai = {
+        "EMBEDDING_PROVIDER": "openai",
+        "EMBEDDING_MODEL": "text-embedding-3-small",
+        "EMBEDDING_DIM": "1536",
+    }
+    assert config.load_settings(openai).embedding_query_prefix == ""
+    unknown = {"EMBEDDING_MODEL": "someorg/custom-embedder", "EMBEDDING_DIM": "512"}
+    assert config.load_settings(unknown).embedding_query_prefix == ""
+
+
+@pytest.mark.parametrize("raw", ["query:", "query: ", "  query:   "])
+def test_query_prefix_override_is_normalized_to_one_trailing_space(raw: str) -> None:
+    assert config.load_settings({"EMBEDDING_QUERY_PREFIX": raw}).embedding_query_prefix == (
+        "query: "
+    )
+
+
+def test_blank_query_prefix_means_model_default() -> None:
+    assert config.load_settings({"EMBEDDING_QUERY_PREFIX": "  "}).embedding_query_prefix == _PREFIX
+
+
+def test_stripped_bge_instruction_round_trips() -> None:
+    env = {"EMBEDDING_QUERY_PREFIX": _PREFIX.rstrip()}
+    assert config.load_settings(env).embedding_query_prefix == _PREFIX
+
+
+def test_run_manifest_records_query_prefix() -> None:
+    assert _manifest().embedding_query_prefix == _PREFIX
+    assert _manifest(embedding_query_prefix="") != _manifest()
+
+
+@pytest.mark.parametrize(
+    ("provider", "env_var"), [("openai", "OPENAI_API_KEY"), ("anthropic", "ANTHROPIC_API_KEY")]
+)
+def test_missing_api_key_message(provider: str, env_var: str) -> None:
+    msg = config.missing_api_key_message(provider)
+    assert repr(provider) in msg
+    assert env_var in msg
+    assert f"Set {env_var} in .env" in msg
+    assert "LLM_MODE=replay once the LLM cache exists" in msg
+    err = config.MissingAPIKeyError(provider)
+    assert str(err) == msg
+    assert (err.provider, err.env_var) == (provider, env_var)
+
+
+def test_ollama_needs_no_key() -> None:
+    assert config.API_KEY_ENV_VARS["ollama"] is None
+    with pytest.raises(ValueError):
+        config.missing_api_key_message("ollama")
+    assert config.api_key_for(config.load_settings({}), "ollama") is None
+
+
+def test_missing_api_key_error_is_config_error() -> None:
+    assert issubclass(config.MissingAPIKeyError, config.ConfigError)
+
+
+def test_api_key_for() -> None:
+    s = config.load_settings({"OPENAI_API_KEY": "sk-1"})
+    assert config.api_key_for(s, "openai") == "sk-1"
+    with pytest.raises(config.MissingAPIKeyError, match="ANTHROPIC_API_KEY"):
+        config.api_key_for(s, "anthropic")
+    with pytest.raises(config.ConfigError, match="unknown"):
+        config.api_key_for(s, "gemini")
+
+
+@pytest.mark.parametrize("mode", LLM_MODES)
+def test_settings_load_with_no_keys_in_every_mode(mode: str) -> None:
+    env = {"LLM_MODE": mode, "LLM_PROVIDER": "anthropic", "JUDGE_PROVIDER": "openai"}
+    s = config.load_settings(env)
+    assert (s.openai_api_key, s.anthropic_api_key, s.llm_mode) == (None, None, mode)
+
+
+def test_llm_client_doc_names_missing_key_error() -> None:
+    doc = LLMClient.__doc__ or ""
+    assert "MissingAPIKeyError" in doc
+    assert "no stack trace" in doc
+    assert "eval-harness" in doc

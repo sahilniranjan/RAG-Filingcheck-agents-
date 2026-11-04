@@ -5,16 +5,20 @@ Every agent and module imports its types from here. These models are frozen
 instead of silently. All models round-trip through JSON with
 ``Model.model_validate_json(obj.model_dump_json())``.
 
-This file holds types and function signatures, plus four tiny pure helpers
-(normalize_whitespace, evidence_in_chunk, conflict_precondition, format_citation)
-that define shared rules so every module and test uses one definition. It contains
-no feature logic. Change it only through contracts-architect, with a stated reason.
+This file holds types and function signatures, plus a few tiny pure helpers
+(normalize_whitespace, evidence_in_chunk, conflict_precondition, format_citation,
+llm_cache_key, index_fingerprint) that define shared rules so every module and test
+uses one definition. It contains no feature logic. Change it only through
+contracts-architect, with a stated reason.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import re
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import date
 from enum import StrEnum
@@ -39,6 +43,38 @@ RetrievalMode = Literal["bm25", "vector", "hybrid", "hybrid_rerank"]
 """Retrieval modes the search() entry point and the eval ablations must support."""
 
 RETRIEVAL_MODES: tuple[RetrievalMode, ...] = ("bm25", "vector", "hybrid", "hybrid_rerank")
+
+EmbeddingProvider = Literal["local", "openai"]
+"""Where embeddings come from. "local" runs a sentence-transformers model in process
+(no key, the default); "openai" calls the OpenAI embeddings API."""
+
+EMBEDDING_PROVIDERS: tuple[EmbeddingProvider, ...] = ("local", "openai")
+
+LLMProvider = Literal["openai", "anthropic", "ollama"]
+"""Providers an LLMClient can call for generation, verification, and judging.
+"ollama" is a local server reached over HTTP at config OLLAMA_BASE_URL."""
+
+LLM_PROVIDERS: tuple[LLMProvider, ...] = ("openai", "anthropic", "ollama")
+
+LLMMode = Literal["live", "record", "replay"]
+"""How LLMClient treats the response cache, from config LLM_MODE.
+
+live: call the provider; the cache is neither read nor written.
+record: call the provider and write every response to the cache.
+replay: read only the cache. A missing key raises CacheMissError. Never touches the
+network, needs no API key, and refuses to run on a mismatched index (see
+IndexFingerprintMismatchError).
+"""
+
+LLM_MODES: tuple[LLMMode, ...] = ("live", "record", "replay")
+
+LLMRole = Literal["system", "user", "assistant"]
+
+EmbedKind = Literal["query", "passage"]
+"""What a text is being embedded as. Ingest embeds chunks as "passage"; retrieval
+embeds the question as "query". See embedding_input."""
+
+EMBED_KINDS: tuple[EmbedKind, ...] = ("query", "passage")
 
 ExpectedBehavior = Literal["answer", "needs_review"]
 
@@ -69,6 +105,9 @@ Coverage = Mapping[str, frozenset[int]]
 
 CHUNK_ID_LENGTH = 32
 """Number of hex characters kept from the sha256 digest for a chunk_id."""
+
+Sha256Hex = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+"""A full sha256 digest as 64 lowercase hex characters."""
 
 # Gold quote cap. Fixed on purpose so golden item validity never depends on .env or
 # chunking settings: a golden.jsonl that validates today validates on every machine.
@@ -641,8 +680,241 @@ class GoldenItem(_Frozen):
 
 
 # ---------------------------------------------------------------------------
+# LLM calls, response cache, and run reproducibility
+# ---------------------------------------------------------------------------
+
+
+class LLMMessage(_Frozen):
+    """One chat message sent to an LLM, in the order the provider should see it."""
+
+    role: LLMRole
+    content: Annotated[str, Field(min_length=1)]
+
+
+class LLMResponse(_Frozen):
+    """What LLMClient.complete returns.
+
+    input_tokens and output_tokens fill StageMetrics.prompt_tokens and
+    StageMetrics.completion_tokens. On a cache hit (cache_hit True, only possible in
+    replay mode) they are the counts recorded when the response was first made, so
+    token metrics stay comparable across modes; callers decide whether a replayed
+    call costs anything. provider and model echo what was actually called.
+    """
+
+    text: str
+    input_tokens: Annotated[int, Field(ge=0)]
+    output_tokens: Annotated[int, Field(ge=0)]
+    cache_hit: bool
+    provider: LLMProvider
+    model: Annotated[str, Field(min_length=1)]
+
+
+class CacheMissError(RuntimeError):
+    """Replay mode found no cached response for a call's llm_cache_key.
+
+    Raised instead of calling the provider: replay never touches the network. Fix it
+    by running once with LLM_MODE=record for the same prompts, models, and index.
+    """
+
+
+class IndexFingerprintMismatchError(RuntimeError):
+    """Replay refuses to run on an index that differs from the recorded one.
+
+    The LLM cache is recorded together with the index_fingerprint of the index the
+    prompts were built from. In replay mode, if the fingerprint of the loaded index
+    does not match the one recorded with the cache, the run stops with this error
+    before any LLM call, because cached answers would cite chunks that may not
+    exist or may hold different text.
+    """
+
+
+LLM_CACHE_KEY_VERSION = 1
+"""Bumped whenever the llm_cache_key encoding changes, so old cache entries miss
+cleanly instead of matching the wrong call."""
+
+INDEX_FINGERPRINT_VERSION = 1
+"""Bumped whenever the index_fingerprint encoding changes."""
+
+
+def _canonical_sha256(payload: object) -> str:
+    """sha256 hex of payload as canonical JSON: sorted keys, no spaces, UTF-8."""
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def llm_cache_key(
+    provider: str,
+    model: str,
+    prompt_version: str,
+    messages: Sequence[LLMMessage],
+    temperature: float,
+) -> str:
+    """Return the response cache key for one LLM call: sha256 hex, 64 characters.
+
+    The key covers provider, model, prompt_version, every message's role and content
+    in order, and temperature. Any change to one of them gives a different key; the
+    same inputs give the same key on any machine. Temperature is normalized to a
+    float first, so 0 and 0.0 (and -0.0) give the same key.
+
+    Raises ValueError if prompt_version is empty or temperature is not finite.
+    """
+    if not prompt_version.strip():
+        raise ValueError("prompt_version must be non-empty")
+    temp = float(temperature)
+    if not math.isfinite(temp):
+        raise ValueError(f"temperature must be finite, got {temperature!r}")
+    return _canonical_sha256(
+        {
+            "v": LLM_CACHE_KEY_VERSION,
+            "provider": provider,
+            "model": model,
+            "prompt_version": prompt_version,
+            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "temperature": temp + 0.0,  # + 0.0 turns -0.0 into 0.0
+        }
+    )
+
+
+def embedding_input(text: str, kind: EmbedKind, query_prefix: str) -> str:
+    """Return the exact string sent to the embedding model. The one shared rule.
+
+    A "query" gets query_prefix (config EMBEDDING_QUERY_PREFIX) prepended by plain
+    concatenation; a "passage" is returned unchanged and the prefix is ignored. Every
+    EmbedTexts implementation (llm/embed.py) must build its model input with this.
+    Raises ValueError for any other kind.
+    """
+    if kind == "query":
+        return query_prefix + text
+    if kind == "passage":
+        return text
+    raise ValueError(f"unknown embed kind {kind!r}, expected one of {', '.join(EMBED_KINDS)}")
+
+
+def index_fingerprint(
+    chunk_ids: Sequence[str],
+    embedding_provider: str,
+    embedding_model: str,
+    embedding_dim: int,
+) -> str:
+    """Return a fingerprint of an index: sha256 hex, 64 characters.
+
+    It covers the set of chunk_ids (order does not matter, they are sorted first) and
+    the embedding provider, model, and dimension. Since chunk_id hashes chunk text,
+    any change to chunking or source text changes the fingerprint too. An empty index
+    is allowed and has its own fingerprint.
+
+    Raises ValueError if chunk_ids contains a duplicate (the schema makes chunk_id
+    unique, so a duplicate means the caller read the index wrongly) or if
+    embedding_dim is not positive.
+    """
+    ids = list(chunk_ids)
+    if len(set(ids)) != len(ids):
+        dupes = sorted(c for c, n in Counter(ids).items() if n > 1)
+        raise ValueError(f"duplicate chunk_ids in index fingerprint input: {dupes[:5]}")
+    if embedding_dim < 1:
+        raise ValueError(f"embedding_dim must be positive, got {embedding_dim}")
+    return _canonical_sha256(
+        {
+            "v": INDEX_FINGERPRINT_VERSION,
+            "chunk_ids": sorted(ids),
+            "embedding_provider": embedding_provider,
+            "embedding_model": embedding_model,
+            "embedding_dim": embedding_dim,
+        }
+    )
+
+
+class RunManifest(_Frozen):
+    """What produced a run. evals/results.json must embed one.
+
+    It records the index_fingerprint, the LLM_MODE, the embedding setup (including
+    embedding_query_prefix, which changes query vectors and so retrieval results),
+    and the provider and model for generation, verification, and judging, so anyone can
+    tell whether two results files are comparable and whether a replay cache fits.
+    """
+
+    index_fingerprint: Sha256Hex
+    llm_mode: LLMMode
+    embedding_provider: EmbeddingProvider
+    embedding_model: Annotated[str, Field(min_length=1)]
+    embedding_dim: Annotated[int, Field(ge=1)]
+    embedding_query_prefix: str
+    generation_provider: LLMProvider
+    generation_model: Annotated[str, Field(min_length=1)]
+    verifier_provider: LLMProvider
+    verifier_model: Annotated[str, Field(min_length=1)]
+    judge_provider: LLMProvider
+    judge_model: Annotated[str, Field(min_length=1)]
+    llm_temperature: float
+
+
+# ---------------------------------------------------------------------------
 # Function signatures (Protocols). Implementations live in their own modules.
 # ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class EmbedTexts(Protocol):
+    """ingest and retrieve: embed texts with the configured embedding provider.
+
+    Implemented in llm/embed.py, owned by edgar-ingest.
+
+    Inputs: a sequence of texts and their kind. Ingest passes kind="passage" for
+    chunks; retrieval passes kind="query" for the question. Each model input is
+    embedding_input(text, kind, config EMBEDDING_QUERY_PREFIX): queries get the
+    prefix prepended, passages get no prefix. Provider, model, and batch size come
+    from config (EMBEDDING_PROVIDER, EMBEDDING_MODEL, EMBEDDING_BATCH_SIZE).
+    Output: exactly one vector per input text, in the same order, each of length
+    config EMBEDDING_DIM and L2-normalized to unit length, for every provider.
+    Deterministic for a given model. An empty input returns an empty list.
+    Failure: raises if the model cannot be loaded or the provider call fails after
+    retries, or if any vector has the wrong length. Never returns a partial list,
+    padded or truncated vectors, or placeholder vectors.
+    """
+
+    def __call__(self, texts: Sequence[str], kind: EmbedKind) -> list[list[float]]: ...
+
+
+@runtime_checkable
+class LLMClient(Protocol):
+    """llm: the one gateway for every LLM call.
+
+    Implemented in llm/client.py (including the record and replay cache), owned by
+    eval-harness.
+
+    Every generation, verification, and judge call goes through LLMClient. No other
+    module imports or calls a provider SDK (openai, anthropic) or the Ollama HTTP API
+    directly. The client picks behavior from config LLM_MODE:
+    - "live" calls the provider and does not touch the cache.
+    - "record" calls the provider and writes the response to the cache under
+      llm_cache_key(provider, model, prompt_version, messages, temperature).
+    - "replay" reads only the cache. It never touches the network and needs no API
+      key. A missing key raises CacheMissError; it never falls back to a live call.
+
+    Inputs: messages in order, the model name, the provider (one of LLM_PROVIDERS),
+    temperature, and prompt_version, a short string the caller bumps whenever its
+    prompt template changes so stale cache entries stop matching.
+    Output: an LLMResponse with text, token counts, and cache_hit.
+    Failure: replay raises CacheMissError on a miss. In live and record modes, a
+    missing API key for the chosen provider raises config.MissingAPIKeyError (a
+    ConfigError subclass, built with config.api_key_for) at call time, naming the
+    provider and env variable; load_settings never checks keys, so replay works with
+    none. Entry points (scripts, evals/run_evals.py, the API) catch
+    MissingAPIKeyError and print or return only its message, with no stack trace.
+    Provider errors propagate after the client's retries. A failed call is never
+    written to the cache.
+    """
+
+    def complete(
+        self,
+        messages: Sequence[LLMMessage],
+        model: str,
+        provider: LLMProvider,
+        temperature: float,
+        prompt_version: str,
+    ) -> LLMResponse: ...
 
 
 @runtime_checkable
@@ -859,6 +1131,28 @@ class Ask(Protocol):
 
 __all__ = [
     "CHUNK_ID_LENGTH",
+    "EMBEDDING_PROVIDERS",
+    "EMBED_KINDS",
+    "EmbedKind",
+    "embedding_input",
+    "INDEX_FINGERPRINT_VERSION",
+    "LLM_CACHE_KEY_VERSION",
+    "LLM_MODES",
+    "LLM_PROVIDERS",
+    "CacheMissError",
+    "EmbedTexts",
+    "EmbeddingProvider",
+    "IndexFingerprintMismatchError",
+    "LLMClient",
+    "LLMMessage",
+    "LLMMode",
+    "LLMProvider",
+    "LLMResponse",
+    "LLMRole",
+    "RunManifest",
+    "Sha256Hex",
+    "index_fingerprint",
+    "llm_cache_key",
     "GOLDEN_TYPES",
     "GOLD_QUOTE_ENCODING",
     "GOLD_QUOTE_MAX_TOKENS",

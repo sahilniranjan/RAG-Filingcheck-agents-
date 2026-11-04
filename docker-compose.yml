@@ -1,5 +1,11 @@
-# Local Postgres 16 with pgvector for FilingCheck.
+# Local Postgres 16 with pgvector for FilingCheck, plus an optional Ollama server.
 # sql/schema.sql runs automatically the first time the volume is created.
+#
+# docker compose up -d                    starts only Postgres.
+# docker compose --profile ollama up -d   also starts Ollama on port 11434, for
+#                                         LLM_PROVIDER / VERIFIER_PROVIDER /
+#                                         JUDGE_PROVIDER=ollama. Pull a model once
+#                                         with: docker compose exec ollama ollama pull <model>
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -20,5 +26,15 @@ services:
       retries: 10
       start_period: 10s
 
+  ollama:
+    image: ollama/ollama:0.40.13
+    container_name: filingcheck-ollama
+    profiles: ["ollama"]
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+
 volumes:
   pgdata:
+  ollama_models:

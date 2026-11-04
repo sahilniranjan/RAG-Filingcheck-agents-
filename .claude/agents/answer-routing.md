@@ -61,3 +61,14 @@ CHECKPOINT A DECISIONS (Sahil, binding):
 - The mechanical check also confirms each citation's chunk_id is among the provided
   chunks and its ticker, fiscal_year, item, and chunk_index match that chunk.
 - Render citations with contracts.format_citation ("[TICKER FYyyyy Item, chunk n]").
+
+CONTRACTS V2 DECISIONS (Sahil, binding):
+- You CONSUME src/filingcheck/llm/client.py (contracts.LLMClient); you do not own or
+  edit it. eval-harness builds it in Wave 1, including the record/replay cache.
+- Generation uses LLM_PROVIDER + GENERATION_MODEL, verification uses VERIFIER_PROVIDER +
+  VERIFIER_MODEL. Every prompt carries a prompt_version string; bump it whenever a prompt
+  template changes. No module in answer/ or pipeline.py imports openai, anthropic, or any
+  provider SDK, or calls the Ollama HTTP API; everything goes through the client.
+  Unit tests use a fake LLMClient.
+- Let config.MissingAPIKeyError propagate from ask(); the API turns it into a clean
+  error response.

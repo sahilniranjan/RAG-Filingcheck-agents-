@@ -9,6 +9,7 @@ CLAUDE.md, and contracts.py first.
 OWNED paths:
 - evals/ (EXCEPT evals/golden.jsonl, which you must never create or edit)
 - tests/test_evals_*.py
+- src/filingcheck/llm/client.py, tests/test_llm_client.py (Contracts v2, built in Wave 1)
 
 HARD RULE: You must never create, generate, edit, or suggest content for
 evals/golden.jsonl. You may only create evals/golden.example.jsonl with exactly 3 fake
@@ -62,3 +63,39 @@ CHECKPOINT A DECISIONS (Sahil, binding):
   Never count them as retrieval misses.
 - GoldenItem.type is one of single_section, multi_chunk, unanswerable, out_of_scope.
   Report every metric per type as well as overall.
+
+CONTRACTS V2 DECISIONS (Sahil, binding):
+- You own and build src/filingcheck/llm/client.py in Wave 1. It implements
+  contracts.LLMClient for "openai", "anthropic" and "ollama" (ollama over HTTP at config
+  OLLAMA_BASE_URL with httpx) and the LLM_MODE behavior: "live" calls the provider,
+  "record" calls it and writes the cache, "replay" reads only the cache, raises
+  contracts.CacheMissError on a missing key and never touches the network. Keys come
+  from contracts.llm_cache_key. A failed call is never cached.
+- It is the only module allowed to import openai or anthropic for LLM calls
+  (llm/embed.py, owned by edgar-ingest, may import openai for embeddings only).
+- Missing API key in live or record mode: raise config.MissingAPIKeyError at call time
+  (never at import or config load, so replay works with no keys). Its message names the
+  missing env variable and suggests LLM_MODE=replay once the cache exists. run_evals.py
+  and every script you own catch it at the entry point, print only the message to
+  stderr, and exit non-zero, with no stack trace. Test that.
+- Tests mock every provider (no network); replay tests prove a miss raises and that no
+  HTTP client is ever constructed.
+- Judge calls go through the client with JUDGE_PROVIDER + JUDGE_MODEL. Never import a
+  provider SDK in evals/.
+- results.json embeds a contracts RunManifest, including the loaded index fingerprint
+  (contracts.index_fingerprint over the indexed chunk ids) and LLM_MODE.
+- In replay mode, refuse to run (contracts.IndexFingerprintMismatchError) if the loaded
+  index fingerprint differs from the one recorded with the LLM cache.
+
+WAVE 1 RULE (Sahil, binding):
+- Treat UnroutedResult.verification = None as UNKNOWN for UNSUPPORTED_CLAIM scoring:
+  neither a hit nor a miss, excluded from that metric's denominator, and reported as a
+  separate "unsupported_claim_unknown" count (overall and per golden type).
+
+FOLLOW-UPS (recorded, do not build until Sahil asks):
+- A committed LLM cache file that anyone can replay without API keys. In Wave 1 keep the
+  cache behind a small read/write interface with a simple local format (one record per
+  contracts.llm_cache_key with response, provider, model, prompt_version and the index
+  fingerprint it was recorded against); the final shareable format is a follow-up.
+- run_evals.py --replay: sets LLM_MODE=replay, checks the fingerprint, and fails on the
+  first CacheMissError instead of silently skipping a question.

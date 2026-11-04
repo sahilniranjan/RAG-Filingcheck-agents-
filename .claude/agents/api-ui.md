@@ -58,3 +58,18 @@ CHECKPOINT A DECISIONS (Sahil, binding):
      python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"
   Never weaken the network guard to make CI pass. A NetworkBlockedError naming
   openaipublic.blob.core.windows.net means this pre-fetch step is missing or broken.
+- Embedding model cache in CI (same pattern as tiktoken, every job that needs the real
+  model, for example evals.yml and any integration job):
+  1. Read EMBEDDING_MODEL from config defaults into an env var, so the cache key and the
+     model in use can never drift apart.
+  2. Set HF_HOME to a workspace path, for example .cache/huggingface.
+  3. Restore it with actions/cache, key "hf-<model name with / replaced by ->-v1" (today
+     hf-BAAI-bge-small-en-v1.5-v1). Include the model name; bump the suffix to force a
+     refresh.
+  4. On a cache miss, pre-fetch in a separate step outside pytest, for example
+     python -c "from sentence_transformers import SentenceTransformer as S; S('$EMBEDDING_MODEL')"
+  Unit tests never load the real embedding model; they use a mocked embedder, so the
+  unit test job must pass with HF_HUB_OFFLINE=1 and an empty HF cache. Set that in ci.yml.
+- Missing API keys: POST /ask maps config.MissingAPIKeyError to a 503 JSON error whose
+  detail is only the error message (names the missing key, suggests LLM_MODE=replay),
+  with no stack trace in the response or logs. Test it.

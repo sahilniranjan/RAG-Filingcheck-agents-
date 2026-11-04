@@ -1,7 +1,7 @@
 -- FilingCheck schema. Postgres 16 + pgvector.
--- The vector dimension (1536) must match config EMBEDDING_DIM and the default
--- EMBEDDING_MODEL (text-embedding-3-small). Changing the model to one with a
--- different dimension requires changing this file and re-ingesting.
+-- The vector dimension (384) must match config EMBEDDING_DIM and the default
+-- EMBEDDING_MODEL (BAAI/bge-small-en-v1.5, run locally). Changing the model to one
+-- with a different dimension requires changing this file and re-ingesting.
 -- Owned by contracts-architect. Safe to run more than once.
 
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     text         TEXT        NOT NULL,
     token_count  INTEGER     NOT NULL CHECK (token_count >= 1),
     filing_url   TEXT        NOT NULL,
-    embedding    vector(1536) NOT NULL,
+    embedding    vector(384)  NOT NULL,
     tsv          tsvector GENERATED ALWAYS AS (to_tsvector('english', text)) STORED,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT chunks_chunk_id_key UNIQUE (chunk_id),

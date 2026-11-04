@@ -34,3 +34,9 @@ REPORT FORMAT:
 - Files created (one line each)
 - pytest -q tests/test_retrieve_*.py output, pasted
 - Any assumption about the DB schema you relied on
+
+CONTRACTS V2 DECISIONS (Sahil, binding):
+- Embed questions only through src/filingcheck/llm/embed.py (owned by edgar-ingest)
+  with kind="query". Never load a sentence-transformers embedding model or call an
+  embeddings API in retrieve/. The cross-encoder reranker is yours and is unaffected.
+- In unit tests, inject a mocked embedder; never load the real model.

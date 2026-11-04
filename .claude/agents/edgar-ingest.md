@@ -55,3 +55,28 @@ CHECKPOINT A DECISIONS (Sahil, binding):
 - Chunker guarantee: any span of up to contracts.GOLD_QUOTE_MAX_TOKENS (60) tokens inside a section
   lies wholly inside at least one chunk. Prefer sentence boundaries. Test it with real
   sentence lengths from the HTML fixtures.
+
+CONTRACTS V2 DECISIONS (Sahil, binding):
+- You also own src/filingcheck/llm/embed.py and tests/test_llm_embed.py. It implements
+  contracts.EmbedTexts and dispatches on config EMBEDDING_PROVIDER: "local" (default)
+  uses sentence-transformers with EMBEDDING_MODEL (BAAI/bge-small-en-v1.5, 384 dims),
+  "openai" uses the OpenAI embeddings API. Load the local model once. ingest/load.py
+  calls it with kind="passage"; retrieval calls it with kind="query" and has no
+  embedding code of its own. It is the only place outside src/filingcheck/llm/client.py
+  allowed to import openai (embeddings only). The client.py owner is eval-harness.
+- Build the model input with contracts.embedding_input(text, kind, query_prefix):
+  queries get config EMBEDDING_QUERY_PREFIX (the bge retrieval instruction by default),
+  passages get no prefix.
+- L2-normalize every vector for every provider. Vectors must have length config
+  EMBEDDING_DIM; raise a clear error otherwise.
+- Tests use a mocked model, never the real one: assert the query path sends exactly
+  prefix + text and the passage path sends text, that the two paths differ only by the
+  prefix, and that outputs have unit norm. Missing OPENAI_API_KEY with provider "openai"
+  raises config.MissingAPIKeyError at call time.
+
+FOLLOW-UPS (recorded, do not build until Sahil asks):
+- scripts/export_index.py: dump the chunks table (rows plus embeddings) to a portable
+  snapshot file together with its contracts.index_fingerprint, so anyone can load the
+  same index without running EDGAR ingestion or an embedding model.
+- scripts/import_index.py: load that snapshot into Postgres, recompute the fingerprint
+  and refuse to finish if it does not match the one in the snapshot.
